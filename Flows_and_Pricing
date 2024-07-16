@@ -1,0 +1,993 @@
+import pandas as pd
+import numpy as np
+from io import StringIO
+
+import sqlalchemy
+from pyxirr import xirr
+import openpyxl
+import os
+import uuid
+import shutil
+from sqlalchemy import create_engine, text
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import pyodbc
+import logging
+import smtplib
+import logging.handlers
+from email.message import EmailMessage
+import subprocess, sys
+
+Current_Enddate = date(2024, 3, 31)
+Previous_Enddate = date(2023, 12, 31)
+Previous_2_Enddate = date(2023, 9, 30)
+Previous_3_Enddate = date(2023, 6, 30)
+
+# Staging Fund_Master SQL query connection for later join with Fund IRR tables:
+try:
+    pd.options.display.max_columns = None
+    server = 'xxx'
+    database = 'xxx'
+    driver = 'xxx'
+    database_con = f'mssql://@{server}/{database}?driver={driver}'
+
+    global Pricing_df_Final_loc
+    Pricing_df_Final_loc = ''
+    global Pricing_df_Final_Filename
+    Pricing_df_Final_Filename = ''
+
+    global Cashflow_Pull
+    Cashflow_Pull = pd.DataFrame()
+
+    global Realized_Cashflow_Pull
+    Realized_Cashflow_Pull = pd.DataFrame()
+
+    # Setting global variables, source filepath, and loop:
+
+
+    Source = r'xxx'
+
+
+    global FMV
+    FMV_Final = pd.DataFrame()
+    FMV_TP = {
+                              'KeyDescr':['Total Portfolio'],
+                              'Start Date':['1/18/2008'],
+                              'Currency':['USD']}
+
+    FMV_TP = pd.DataFrame(FMV_TP)
+
+    Flows_to_Delete = []
+
+    IRR = pd.DataFrame()
+
+    Aff_Borr_Master = pd.DataFrame()
+
+    today = date.today()
+    today = today.strftime('%m/%d/%Y')
+
+    Affiliate_TP = {'Portfolio':['Gross Fund Level IRR'],
+                              'Start Date':['11/1/2010'],
+                              'Currency':['USD']}
+
+    pd.options.display.max_columns = None
+    server = 'xxx'
+    database = 'xxx'
+    driver = 'xxx'
+    database_con = f'mssql://@{server}/{database}?driver={driver}'
+
+    for file in os.listdir(Source):
+        full_path = f'{Source}/{file}'
+        file = pd.ExcelFile(full_path)
+
+        # Gets the sheet names in the file
+
+        excel_sheet_names = file.sheet_names
+
+        # Creating distinct dataframes for each Excel tab:
+
+        dict_of_sheets = {}
+        for sheet in excel_sheet_names:
+            dict_of_sheets[sheet] = pd.read_excel(file, sheet_name=sheet)
+
+        Realizations = dict_of_sheets['Realizations']
+        Pricing = dict_of_sheets['Pricing']
+        Cashflows = dict_of_sheets['Cashflows'][['Affiliate','Code_Name','flows','date']]
+        New_Borrowers = dict_of_sheets['New_Borrowers']
+        Flows_Delete = dict_of_sheets['Delete_Test']
+        FMV_Replace = dict_of_sheets['FMV_Replace']
+        # Add_Country = dict_of_sheets['Add_Country']
+
+        Pricing['Code_Name'] = Pricing['Code_Name'].replace(''xxx'_OLD',''xxx'')
+        # Pricing.to_csv(r'xxx', index=False)
+
+        # SQL query to pull current affiliate borrower master table:
+
+        Affiliate_Borrower_Master_daily = pd.read_sql_query(f"""SELECT [Affiliate_Code_Name]
+                  ,[Asset_Type]
+                  ,[Start_Date]
+                  ,[WOGA_Reporting]
+                  ,[Issuer]
+                  ,[Affiliate]
+                  ,[Sector]
+                  ,[WOGA_Code_Name]
+                  ,[Realization_Date]
+                  ,[Realization_Status]
+                  ,[Sub_Product_Type]
+                  ,[Loan_Details_ID]
+                  ,[Position_ID]
+                  ,[Cashflow_ID]
+                  ,[Affiliate_Borrower_ID]
+                  ,[Country]
+                  ,[Restructure_ID]
+                  
+              FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_Borrower_Master];""", database_con)
+
+        Affiliate_Borrower_Master = pd.read_sql_query(f"""SELECT [Affiliate_Code_Name]
+                  ,[Asset_Type]
+                  ,[Start_Date]
+                  ,[WOGA_Reporting]
+                  ,[Issuer]
+                  ,[Affiliate]
+                  ,[Sector]
+                  ,[WOGA_Code_Name]
+                  ,[Realization_Date]
+                  ,[Realization_Status]
+                  ,[Sub_Product_Type]
+                  ,[Loan_Details_ID]
+                  ,[Position_ID]
+                  ,[Cashflow_ID]
+                  ,[Affiliate_Borrower_ID]
+                  
+              FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_Borrower_Master]
+          
+          where WOGA_Reporting = 'YES' and Asset_Type <> 'FACTORING';""", database_con)
+
+        Affiliate_Borrower_Master['Start_Date']=pd.to_datetime(Affiliate_Borrower_Master['Start_Date'])
+
+
+        Affiliate_Start_Dates = Affiliate_Borrower_Master.groupby('Affiliate')['Start_Date'].min()
+        Affiliate_Start_Dates = Affiliate_Start_Dates.reset_index()
+
+
+        # Cleaning and formatting the New_Borrowers df from the loader file, creating WOGA_Reporting, Realized_Date, Realized columns:
+
+
+        New_Borrowers = New_Borrowers.rename(columns = {'Code_Name':'Affiliate_Code_Name','Product_Type':'Asset_Type',
+                                                        'Initial Investment Date':'Start_Date'})
+
+        New_Borrowers.insert(0, "WOGA_Reporting", "Yes")
+
+        New_Borrowers.insert(0, "Realization_Date", "12/30/1899")
+
+        New_Borrowers.insert(0, "Realization_Status", "Unrealized")
+
+        New_Borrowers_country = New_Borrowers.loc[:, ['Affiliate_Code_Name', 'Asset_Type', 'Start_Date', 'WOGA_Reporting', 'Issuer', 'Affiliate', 'Sector','WOGA_Code_Name','Realization_Date','Realization_Status','Sub_Product_Type','Loan_Details_ID','Position_ID','Cashflow_ID','Country','Restructure_ID']]
+
+
+        New_Borrowers_country['Start_Date'] = pd.to_datetime(New_Borrowers_country['Start_Date']).dt.date
+
+
+        # Combining New Affiliate Borrowers from loader file with current affiliate borrower master table, then deduplicating on Code_Name:
+
+
+        Affiliate_Borrower_Master2 = pd.concat([Affiliate_Borrower_Master_daily, New_Borrowers_country])
+        Affiliate_Borrower_Master2 = Affiliate_Borrower_Master2.reset_index()
+        Affiliate_Borrower_Master2 = Affiliate_Borrower_Master2.drop(columns = ['index'])
+        # Affiliate_Borrower_Master2.loc[:,"Affiliate_Borrower_ID"] = None
+
+        try:
+            Affiliate_Borrower_no_IDs = Affiliate_Borrower_Master2.query("Affiliate_Borrower_ID.isnull()")
+            Affiliate_Borrower_with_IDs = Affiliate_Borrower_Master2.query("Affiliate_Borrower_ID.notnull()")
+            Affiliate_Borrower_no_IDs.loc[:, "UUID"] = 1
+            Affiliate_Borrower_no_IDs.loc[:, 'UUID'] = Affiliate_Borrower_no_IDs.groupby(['Affiliate', 'Affiliate_Code_Name', 'Issuer']).UUID.transform(lambda g: uuid.uuid4())
+            Affiliate_Borrower_no_IDs = Affiliate_Borrower_no_IDs.drop(columns = ['Affiliate_Borrower_ID'])
+            Affiliate_Borrower_no_IDs = Affiliate_Borrower_no_IDs.rename(columns={'UUID': 'Affiliate_Borrower_ID'})
+
+            Affiliate_Borrower_Master_Final = pd.concat([Affiliate_Borrower_no_IDs, Affiliate_Borrower_with_IDs])
+            Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.reset_index()
+            Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.drop(columns = ['index'])
+
+        except:
+            Affiliate_Borrower_no_IDs = Affiliate_Borrower_Master2.query("Affiliate_Borrower_ID.isnull()")
+            Affiliate_Borrower_with_IDs = Affiliate_Borrower_Master2.query("Affiliate_Borrower_ID.notnull()")
+            Affiliate_Borrower_Master_Final = Affiliate_Borrower_with_IDs
+            Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.reset_index()
+            Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.drop(columns=['index'])
+        # Updating Realizations data using the realizations tab in the loader file:
+        Realizations = Realizations.rename(columns = {'Code_Name':'Affiliate_Code_Name','Realization_Date':'Loader_Realization_Date','Affiliate':'Loader_Affiliate'})
+        Realizations['Affiliate_Code_Name'] = Realizations['Affiliate_Code_Name'].astype(str)
+        Realizations['Affiliate_Code_Name'] = Realizations['Affiliate_Code_Name'].apply(str.upper)
+        # Realizations['Affiliate_Code_Name'] = Realizations['Affiliate_Code_Name'].str.strip()
+        Affiliate_Borrower_Master_Final['Affiliate_Code_Name']= Affiliate_Borrower_Master_Final['Affiliate_Code_Name'].astype(str)
+        Affiliate_Borrower_Master_Final['Affiliate_Code_Name'] = Affiliate_Borrower_Master_Final['Affiliate_Code_Name'].apply(str.upper)
+        # Affiliate_Borrower_Master_Final['Affiliate_Code_Name'] = Affiliate_Borrower_Master_Final['Affiliate_Code_Name'].str.strip()
+        Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.merge(Realizations, how='left', on='Affiliate_Code_Name')
+
+        Affiliate_Borrower_Master_Final['Loader_Realization_Date'] = pd.to_datetime( Affiliate_Borrower_Master_Final['Loader_Realization_Date']).dt.date
+        Affiliate_Borrower_Master_Final['Loader_Realization_Date'] = Affiliate_Borrower_Master_Final['Loader_Realization_Date'].fillna('NA')
+        Affiliate_Borrower_Master_Final['Realized_Date2'] = np.where(Affiliate_Borrower_Master_Final['Loader_Realization_Date'] == 'NA', Affiliate_Borrower_Master_Final['Realization_Date'],
+                                                                   Affiliate_Borrower_Master_Final['Loader_Realization_Date'])
+
+        Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.drop(columns = ['Loader_Realization_Date','Realization_Date','Loader_Affiliate'])
+        Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.rename(columns = {'Realized_Date2':'Realization_Date'})
+        Affiliate_Borrower_Master_Final['Asset_Type'] = Affiliate_Borrower_Master_Final['Asset_Type'].astype(str)
+        Affiliate_Borrower_Master_Final['Asset_Type'] = Affiliate_Borrower_Master_Final['Asset_Type'].apply(str.upper)
+
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final.loc[:,
+                                             ['Affiliate_Code_Name', 'Asset_Type', 'Start_Date', 'WOGA_Reporting',
+                                              'Issuer',
+                                              'Affiliate', 'Sector', 'WOGA_Code_Name', 'Realization_Date',
+                                              'Realization_Status', 'Sub_Product_Type', 'Loan_Details_ID',
+                                              'Position_ID', 'Cashflow_ID'
+                                                 , 'Affiliate_Borrower_ID', 'Country', 'Restructure_ID']]
+
+        Affiliate_Borrower_Master_Final = Affiliate_Borrower_Master_Final.loc[:, ['Affiliate_Code_Name','Asset_Type','Start_Date','WOGA_Reporting','Issuer',
+                                                                                   'Affiliate','Sector','WOGA_Code_Name','Realization_Date','Realization_Status','Sub_Product_Type','Loan_Details_ID','Position_ID','Cashflow_ID'
+                                                                                   ,'Affiliate_Borrower_ID']]
+
+        Affiliate_Borrower_Master_Final_v2['Affiliate'] = Affiliate_Borrower_Master_Final_v2['Affiliate'].replace('WOA',
+                                                                                                            'WOAM')
+        Affiliate_Borrower_Master_Final_v2.loc[:, ['Extract_Date']] = today
+
+
+        Affiliate_Borrower_Master_Final['Affiliate'] = Affiliate_Borrower_Master_Final['Affiliate'].replace('WOA','WOAM')
+        Affiliate_Borrower_Master_Final.loc[:,['Extract_Date']] = today
+
+        # Creating save location, filename, current enddate, and today's date variables:
+        date = datetime.today()
+        date = date.strftime("%m_%d_%Y")
+
+        Affiliate_Borrower_Master_loc =  r'xxx'
+        Affiliate_Borrower_Master_Filename = f'Affiliate_Borrower_Master_Table_{date}.csv'
+        # print(Affiliate_Borrower_Master_Final)
+
+
+        Position_and_Loan_ID_Mapping = {'Affiliate': ['WO ABL','WOAM','WOBC','WOCF','WOCFE','WOEF','WOHCF','WOLF','WOTF','WOREC','WOCFE 2'],
+                                        'Position_ID_Mapping': ['Borrower Name','Borrower Name','Borrower Name','Loan ID','Borrower Name','Loan_Name','Loan ID','Borrower Name','Loan_Name','Borrower Name','Loan ID'],
+                                        'Loan_ID_Mapping': ['Borrower Name','Borrower Name','Borrower Name','Code_Name','Borrower Name','Loan_Name','Loan ID','Borrower Name','Code_Name','Borrower Name','Borrower Name']}
+
+        Position_and_Loan_ID_Mapping = pd.DataFrame(Position_and_Loan_ID_Mapping)
+        # print(Affiliate_Borrower_Master_Final)
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final_v2.merge(Position_and_Loan_ID_Mapping, how ='left', on='Affiliate')
+        Affiliate_Borrower_Master_Final_v2['Sector'] = Affiliate_Borrower_Master_Final_v2['Sector'].astype(str)
+        Affiliate_Borrower_Master_Final_v2['Sector'] = Affiliate_Borrower_Master_Final_v2['Sector'].apply(str.upper)
+
+        Affiliate_Borrower_Master_Country_Restructure_ID = pd.read_sql_query(f"""SELECT [Affiliate_Code_Name]
+        ,[Country]
+        ,Restructure_ID
+        FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_Borrower_Master];""", database_con)
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final_v2.merge(Affiliate_Borrower_Master_Country_Restructure_ID, how = 'left', on = 'Affiliate_Code_Name')
+        # print(Affiliate_Borrower_Master_Final_v2)
+        New_Borrowers['Affiliate_Code_Name'] = New_Borrowers['Affiliate_Code_Name'].astype(str)
+        New_Borrowers['Affiliate_Code_Name'] = New_Borrowers['Affiliate_Code_Name'].apply(str.upper)
+
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final_v2.merge(New_Borrowers[['Affiliate_Code_Name','Country','Restructure_ID']].copy(), how = 'left', on = 'Affiliate_Code_Name')
+
+        Affiliate_Borrower_Master_Final_v2['Country'] = np.where(Affiliate_Borrower_Master_Final_v2['Country_y'].isnull(), Affiliate_Borrower_Master_Final_v2['Country_x'], Affiliate_Borrower_Master_Final_v2['Country_y'])
+        # print(Affiliate_Borrower_Master_Final_v2)
+        Affiliate_Borrower_Master_Final_v2['Restructure_ID'] = np.where(Affiliate_Borrower_Master_Final_v2['Restructure_ID_y'].isnull(), Affiliate_Borrower_Master_Final_v2['Restructure_ID_x'],
+            Affiliate_Borrower_Master_Final_v2['Restructure_ID_y'])
+
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final_v2.drop(columns = ['Country_x', 'Country_y'])
+        Affiliate_Borrower_Master_Final_v2 = Affiliate_Borrower_Master_Final_v2.drop(columns=['Restructure_ID_x', 'Restructure_ID_y'])
+
+        Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'] = Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'].astype(str)
+        # Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'] = Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'].str.strip()
+        Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'] = Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'].apply(str.upper)
+        Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'] = Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'].str.replace(',', '')
+        Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'] = Affiliate_Borrower_Master_Final_v2['Loan_Details_ID'].str.replace('.', '')
+
+        Affiliate_Borrower_Master_Final_v2['Position_ID'] = Affiliate_Borrower_Master_Final_v2['Position_ID'].astype(str)
+        # Affiliate_Borrower_Master_Final_v2['Position_ID'] = Affiliate_Borrower_Master_Final_v2['Position_ID'].str.strip()
+        Affiliate_Borrower_Master_Final_v2['Position_ID'] = Affiliate_Borrower_Master_Final_v2['Position_ID'].apply(str.upper)
+        Affiliate_Borrower_Master_Final_v2['Position_ID'] = Affiliate_Borrower_Master_Final_v2['Position_ID'].str.replace(',', '')
+        Affiliate_Borrower_Master_Final_v2['Position_ID'] = Affiliate_Borrower_Master_Final_v2['Position_ID'].str.replace('.', '')
+
+        Affiliate_Borrower_Master_Final_v2.to_csv(f'{Affiliate_Borrower_Master_loc}/{Affiliate_Borrower_Master_Filename}',
+                                               index=False)
+
+        Affiliate_Borrower_Master_Final_v2.to_sql("Affiliate_Borrower_Master", con=database_con, schema='xxx',
+                                                  if_exists='replace', index=False, dtype = {'Initial_Investment_Date': sqlalchemy.Date(),
+                                                                                             'Realization_Date': sqlalchemy.Date(),
+                                                                                             'Extract_Date': sqlalchemy.Date()})
+
+        # Creating distinct dataframes for NAV and GAV and renaming 'NAV' and 'GAV' to 'Cash Flow' in preparation for join:
+        Affiliate_IRR_Pricing = pd.read_sql_query(f"""SELECT [Affiliate]
+          ,[Affiliate_Code_Name]
+          ,[Ending_Market_Value_Book]
+          ,[Period_End_Date]
+          
+        FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_IRR_Report]
+        where Period_End_Date = '{Current_Enddate}' and Ending_Market_Value_Book <> 0;""", database_con)
+        # print(Affiliate_IRR_Pricing)
+
+
+        Affiliate_IRR_Pricing = Affiliate_IRR_Pricing.rename(columns = {'Ending_Market_Value_Book':'FMV'})
+        Affiliate_IRR_Pricing['Affiliate_Code_Name'] = Affiliate_IRR_Pricing['Affiliate_Code_Name'].replace(''xxx'_OLD',''xxx'-4652')
+        Pricing = Pricing.rename(columns = {'Code_Name':'Affiliate_Code_Name','Period':'Period_End_Date'})
+        Pricing = Pricing[['Affiliate','Affiliate_Code_Name','FMV','Period_End_Date']].copy()
+
+        Pricing = pd.concat([Affiliate_IRR_Pricing, Pricing])
+
+        Pricing = Pricing.reset_index()
+        Pricing = Pricing.drop(columns = ['index'])
+        Pricing['Period_End_Date'] = pd.to_datetime(Pricing['Period_End_Date']).dt.date
+
+        # Updating FMV values using the 'FMV Replace' tab in the loader file:
+        Pricing['Affiliate_Code_Name'] = Pricing['Affiliate_Code_Name'].astype(str)
+        Pricing['Affiliate_Code_Name'] = Pricing['Affiliate_Code_Name'].apply(str.upper)
+        # Pricing['Affiliate_Code_Name'] = Pricing['Affiliate_Code_Name'].str.strip()
+
+        FMV_Replace['Affiliate_Code_Name'] = FMV_Replace['Affiliate_Code_Name'].astype(str)
+        FMV_Replace['Affiliate_Code_Name'] = FMV_Replace['Affiliate_Code_Name'].apply(str.upper)
+        # FMV_Replace['Affiliate_Code_Name'] = FMV_Replace['Affiliate_Code_Name'].str.strip()
+
+        Pricing = Pricing.merge(FMV_Replace, how='left', on='Affiliate_Code_Name')
+
+        Pricing['updated_fmv'] = np.where(Pricing['Loader_Updated_FMV'].notnull(),
+                                                            Pricing['Loader_Updated_FMV'],
+                                                            Pricing['FMV'])
+        Pricing = Pricing.drop(columns=['FMV', 'Loader_Updated_FMV'])
+        Pricing = Pricing.rename(columns={'updated_fmv': 'FMV'})
+
+        for Period in Pricing['Period_End_Date']:
+            Pricing['Period_End_Date'] = pd.to_datetime(Pricing['Period_End_Date']).dt.date
+
+        Pricing_for_IRR = Pricing.rename(columns = {'FMV': 'flows', 'Period_End_Date':'date'})
+
+
+        # Pulling historical cashflows for loader file affiliates <> 'WOCF' and changing pricing period end date frome datetime to date
+
+        Cashflows['date'] = pd.to_datetime(Cashflows['date']).dt.date
+
+        # calculating Affiliate ending market value books for each affiliate in loader file, creating/pulling other columns, then making the df:
+        Affiliate_FMVS = Pricing.groupby(['Affiliate']).sum('FMV')
+
+        Affiliate_FMVS = Affiliate_FMVS.rename(columns={'FMV': 'Ending_Market_Value_Book'})
+        Affiliate_FMVS = Affiliate_FMVS.reset_index()
+
+        # try:
+        #     Current_Enddate = Pricing.loc[1]['Period']
+        #
+        # except:
+        #     date2 = datetime.today()
+        #     Current_Enddate = date2.today() - pd.tseries.offsets.QuarterEnd()
+        #     Current_Enddate = Current_Enddate.date()
+
+        try:
+            Affiliate_FMVS.loc[:, "Issuer"] = 'Total Portfolio'
+            Affiliate_FMVS.loc[:, "Currency"] = 'USD'
+
+
+            Affiliate_FMVS = Affiliate_FMVS.merge(Affiliate_Start_Dates, how = 'left')
+        except:
+            print("no deals in pricing tab")
+
+
+        # Previous_Enddate = Current_Enddate - pd.tseries.offsets.QuarterEnd()
+        # Previous_Enddate = Previous_Enddate.date()
+
+    #   Pulling historical flows for all affiliates where adate <= previous period end date:
+
+        Affiliate_Historical = pd.read_sql_query(f"""SELECT Affiliate, Affiliate_Code_Name, flows, ADate, Cashflow_ID
+        FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_IRR_Cashflow_Report]
+        order by ADate;""", database_con)
+
+
+        Cashflow_Pull = pd.concat([Cashflow_Pull, Affiliate_Historical])
+        Cashflows = Cashflows.rename(columns = {'Code_Name':'Affiliate_Code_Name'})
+
+        Cashflow_Pull = Cashflow_Pull.rename(columns = {'ADate':'date'})
+        # print(Cashflow_Pull)
+       # Combining flows, cashflow pull, and pricing data in preparation for IRR calc:
+
+        try:
+            Combined_Flows = pd.concat([Cashflows.astype({'date':'str'}), Cashflow_Pull.astype({'date':'str'})])
+        except:
+            Combined_Flows = Cashflow_Pull.astype({'date': 'str'})
+
+        # Affiliate_Borrower_Master_Final.to_csv(r'xxx',
+        #                                index=False)
+        Affiliate_Borrower_Base = Affiliate_Borrower_Master_Final[Affiliate_Borrower_Master_Final.eval("WOGA_Reporting == 'Yes' & (Asset_Type != 'FACTORING')")]
+
+        Affiliate_Borrower_Base = Affiliate_Borrower_Base[['Affiliate','Affiliate_Code_Name', 'Issuer','WOGA_Code_Name','Asset_Type','Start_Date','Realization_Date','Realization_Status','Affiliate_Borrower_ID']].copy()
+
+        Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].replace('WOA', 'WOAM')
+        Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].astype(str)
+        Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].apply(str.upper)
+        Affiliate_Borrower_Base['Affiliate'] = Affiliate_Borrower_Base['Affiliate'].astype(str)
+        Affiliate_Borrower_Base['Affiliate'] = Affiliate_Borrower_Base['Affiliate'].apply(str.upper)
+        # Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].str.strip()
+        # Affiliate_Borrower_Base.to_csv(r'xxx', index=False)
+        # Pricing_for_IRR.to_csv(r'xxx', index=False)
+
+        # Pricing_for_IRR.to_csv(r'xxx', index=False)
+        Pricing_for_IRR['Affiliate_Code_Name'] = Pricing_for_IRR['Affiliate_Code_Name'].astype(str)
+        Pricing_for_IRR['Affiliate_Code_Name'] = Pricing_for_IRR['Affiliate_Code_Name'].apply(str.upper)
+        # Pricing_for_IRR['Affiliate_Code_Name'] = Pricing_for_IRR['Affiliate_Code_Name'].str.strip()
+        Pricing_for_IRR['Affiliate'] = Pricing_for_IRR['Affiliate'].astype(str)
+        Pricing_for_IRR['Affiliate'] = Pricing_for_IRR['Affiliate'].apply(str.upper)
+        # Pricing_for_IRR.to_csv(r'xxx', index=False)
+        Affiliate_Borrower_Base = Affiliate_Borrower_Base.merge(Pricing_for_IRR, how = 'left', on ='Affiliate_Code_Name')
+        # Affiliate_Borrower_Base.to_csv(r'xxx', index=False)
+        Affiliate_Borrower_Base = Affiliate_Borrower_Base.drop(columns = ['Affiliate_y'])
+        Affiliate_Borrower_Base = Affiliate_Borrower_Base.rename(columns = {'Affiliate_x':'Affiliate'})
+        Affiliate_Borrower_Base['flows'] = Affiliate_Borrower_Base['flows'].fillna(0)
+        Affiliate_Borrower_Base['date'] = Affiliate_Borrower_Base['date'].fillna(Current_Enddate)
+        Affiliate_Borrower_Base['date'] = pd.to_datetime(Affiliate_Borrower_Base['date']).dt.date
+        Affiliate_Borrower_Base = Affiliate_Borrower_Base.drop_duplicates()
+        # print(Affiliate_Borrower_Base)
+
+        Pricing_for_IRR2 = Affiliate_Borrower_Base
+        Pricing_for_IRR2 = Pricing_for_IRR2.drop(columns = ['Issuer','WOGA_Code_Name'])
+
+        # Pricing_for_IRR2.to_csv(r'xxx', index=False)
+
+        Combined_Flows['Affiliate_Code_Name'] = Combined_Flows['Affiliate_Code_Name'].astype(str)
+        Combined_Flows['Affiliate_Code_Name'] = Combined_Flows['Affiliate_Code_Name'].apply(str.upper)
+        Combined_Flows['Affiliate'] = Combined_Flows['Affiliate'].astype(str)
+        Combined_Flows['Affiliate'] = Combined_Flows['Affiliate'].apply(str.upper)
+        # print(Combined_Flows)
+        Pricing_Flows_Combined = pd.concat([Combined_Flows, Pricing_for_IRR2])
+        Pricing_Flows_Combined['date'] = pd.to_datetime(Pricing_Flows_Combined['date']).dt.date
+        Pricing_Flows_Combined = Pricing_Flows_Combined.sort_values('date', ascending=True)
+        Pricing_Flows_Combined['Affiliate_Code_Name'] = Pricing_Flows_Combined['Affiliate_Code_Name'].astype(str)
+        Pricing_Flows_Combined['Affiliate_Code_Name'] = Pricing_Flows_Combined['Affiliate_Code_Name'].apply(str.upper)
+
+
+    #     # Calculating IRR:
+        Pricing_Flows_Combined['Affiliate_Codename_combined'] = Pricing_Flows_Combined['Affiliate'] + " " + Pricing_Flows_Combined['Affiliate_Code_Name']
+        # Pricing_Flows_Combined.to_csv(r'xxx', index=False)
+
+    #    Adding in columns including cashflow ID, Creating the cashflows table:
+        # SQL query to pull current affiliate borrower master table:
+
+        Aff_Borr_Master_Flows = Affiliate_Borrower_Master_Final[['Affiliate_Code_Name', 'Issuer','WOGA_Code_Name']].copy()
+
+        Cashflows_Table = pd.concat([Cashflows, Cashflow_Pull])
+
+
+        Cashflows_Table.insert(4, "Period_End_Date", Current_Enddate)
+
+        CF_Table_count = len(Cashflows_Table.index)
+
+        Cashflows_Table = Cashflows_Table.reset_index()
+        Cashflows_Table = Cashflows_Table.reset_index()
+        try:
+            Cashflows_Table_no_ID = Cashflows_Table.query("Cashflow_ID.isnull()")
+
+            Cashflows_Table_with_ID = Cashflows_Table.query("Cashflow_ID.notnull()")
+            Cashflows_Table_with_ID['Cashflow_ID'] = Cashflows_Table_with_ID['Cashflow_ID'].str.replace(",","")
+            Cashflows_Table_with_ID['Cashflow_ID'] = Cashflows_Table_with_ID['Cashflow_ID'].str.replace('"',"")
+            Cashflows_Table_no_ID = Cashflows_Table_no_ID.drop(columns = ['Cashflow_ID'])
+            Cashflows_Table_no_ID.loc[:,"UUID"] = 1
+
+            Cashflows_Table_no_ID.loc[:,'UUID'] = Cashflows_Table_no_ID.groupby(['Affiliate','Affiliate_Code_Name','flows','date','level_0']).UUID.transform(lambda g: uuid.uuid4())
+
+            Cashflows_Table_no_ID=Cashflows_Table_no_ID.drop(columns = ['level_0','index'])
+            Cashflows_Table_with_ID = Cashflows_Table_with_ID.drop(columns = ['level_0','index'])
+            Cashflows_Table_no_ID=Cashflows_Table_no_ID.rename(columns = {'UUID':'Cashflow_ID'})
+
+            Cashflows_Table_no_ID['Affiliate_Code_Name'] = Cashflows_Table_no_ID['Affiliate_Code_Name'].astype(str)
+            Cashflows_Table_no_ID['Affiliate_Code_Name'] = Cashflows_Table_no_ID['Affiliate_Code_Name'].apply(str.upper)
+
+            Aff_Borr_Master_Flows['Affiliate_Code_Name'] = Aff_Borr_Master_Flows['Affiliate_Code_Name'].astype(str)
+            Aff_Borr_Master_Flows['Affiliate_Code_Name'] = Aff_Borr_Master_Flows['Affiliate_Code_Name'].apply(str.upper)
+            Cashflows_Table = pd.concat([Cashflows_Table_no_ID,Cashflows_Table_with_ID])
+            # print(Cashflows_Table)
+        except:
+
+            # print('flows test123')
+            Cashflows_Table_with_ID = Cashflows_Table.query("Cashflow_ID.notnull()")
+
+
+            Cashflows_Table_with_ID = Cashflows_Table_with_ID.drop(columns=['level_0', 'index'])
+
+
+            Aff_Borr_Master_Flows['Affiliate_Code_Name'] = Aff_Borr_Master_Flows['Affiliate_Code_Name'].astype(str)
+            Aff_Borr_Master_Flows['Affiliate_Code_Name'] = Aff_Borr_Master_Flows['Affiliate_Code_Name'].apply(str.upper)
+
+            Cashflows_Table = Cashflows_Table_with_ID
+
+
+        Cashflows_Table['Affiliate_Code_Name'] = Cashflows_Table['Affiliate_Code_Name'].astype(str)
+        Cashflows_Table['Affiliate_Code_Name'] = Cashflows_Table['Affiliate_Code_Name'].apply(str.upper)
+        Cashflows_Table['Affiliate_Code_Name'] = Cashflows_Table['Affiliate_Code_Name'].replace(''xxx'_OLD',''xxx'')
+        Cashflows_Table = Cashflows_Table.merge(Aff_Borr_Master_Flows, how = 'left', on = 'Affiliate_Code_Name')
+
+        Cashflows_Table = Cashflows_Table.dropna()
+
+        for flow in Flows_Delete['Cashflow_ID']:
+            Flows_to_Delete.append(flow)
+
+        Flows_after_Deletion = Cashflows_Table.query("Cashflow_ID not in @Flows_to_Delete")
+
+        # creating save location, file name, current endate, and today's date variables for cashflow table:
+        Flows_after_Deletion = Flows_after_Deletion.rename(columns = {'date':'ADate'})
+        Current_Enddate_2 = Current_Enddate.strftime("%m%d%Y")
+        date2 = datetime.today()
+        date2 = date2.strftime("%m%d%Y")
+        Affiliate_Flows_loc = r'xxx'
+
+        Affiliate_Flows_Filename = f'Affiliate.wo_irr_cashflow.{Current_Enddate_2}.{date2}.csv'
+        Flows_after_Deletion.loc[:, ['Extract_Date']] = today
+
+        # manually setting the period end date
+        Flows_after_Deletion = Flows_after_Deletion.drop(columns = ['Period_End_Date'])
+        Flows_after_Deletion.loc[:,'Period_End_Date'] = Current_Enddate
+
+
+        Flows_after_Deletion = Flows_after_Deletion.loc[:,['ADate', 'Affiliate', 'Issuer', 'flows', 'Extract_Date', 'Period_End_Date', 'Affiliate_Code_Name', 'WOGA_Code_Name','Cashflow_ID']]
+
+        Flows_after_Deletion.to_csv(f'xxx', index=False)
+        # Flows_after_Deletion.to_csv(r'xxx', index=False)
+        # Pricing_for_IRR2.to_csv(r'xxx', index=False)
+
+        Flows_after_Deletion.to_sql("Affiliate_IRR_Cashflow_Report", con=database_con, schema='xxx',
+                                               if_exists='replace', index=False, dtype = {'ADate': sqlalchemy.Date(),
+                                                                                          'Period_End_Date': sqlalchemy.Date(),
+                                                                                          'Extract_Date': sqlalchemy.Date()})
+
+        Flows_after_Deletion.to_sql("Affiliate_IRR_Cashflow_Report", con=database_con, schema='xxx',
+                                    if_exists='append', index=False, dtype={'ADate': sqlalchemy.Date(),
+                                                                             'Period_End_Date': sqlalchemy.Date(),
+                                                                             'Extract_Date': sqlalchemy.Date()})
+
+        Combined_Flows = Flows_after_Deletion[['ADate','Affiliate','Affiliate_Code_Name','flows']].copy()
+        Combined_Flows = Combined_Flows.rename(columns = {'ADate':'date'})
+        Combined_Flows['date'] = pd.to_datetime(Combined_Flows['date']).dt.date
+        Pricing_for_IRR2 = Pricing_for_IRR2[['date','Affiliate','Affiliate_Code_Name','flows']].copy()
+
+        Pricing_Flows_Combined = pd.concat([Combined_Flows, Pricing_for_IRR2])
+        Pricing_Flows_Combined['date'] = pd.to_datetime(Pricing_Flows_Combined['date']).dt.date
+        Pricing_Flows_Combined = Pricing_Flows_Combined.sort_values('date', ascending=True)
+        Pricing_Flows_Combined['Affiliate_Code_Name'] = Pricing_Flows_Combined['Affiliate_Code_Name'].astype(str)
+        Pricing_Flows_Combined['Affiliate_Code_Name'] = Pricing_Flows_Combined['Affiliate_Code_Name'].apply(str.upper)
+        # Pricing_Flows_Combined['Affiliate_Code_Name'] = Pricing_Flows_Combined['Affiliate_Code_Name'].str.strip()
+        Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].astype(str)
+        Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].apply(str.upper)
+        # Affiliate_Borrower_Base['Affiliate_Code_Name'] = Affiliate_Borrower_Base['Affiliate_Code_Name'].str.strip()
+        try:
+            IRR_Calc = Pricing_Flows_Combined.groupby('Affiliate_Code_Name')[["date", "flows"]].apply(xirr, silent = True)
+            IRR_values = IRR_Calc.to_frame()
+
+            IRR_values = IRR_values.rename(columns={0:'IRR'})
+
+            IRR_values = IRR_values.reset_index()
+            # IRR_values.to_csv(r'xxx', index=False)
+
+            Affiliate_Borrower_Base['Affiliate_Codename_combined'] = Affiliate_Borrower_Base['Affiliate'] + " " + Affiliate_Borrower_Base['Affiliate_Code_Name']
+
+            Pricing_IRR_Table = Affiliate_Borrower_Base.merge(IRR_values, how = 'left', on = 'Affiliate_Code_Name')
+
+            # Affiliate_Borrower_Base.to_csv(r'xxx', index=False)
+
+
+
+            Pricing_df1 = Pricing_IRR_Table.rename(columns={'flows':'Ending_Market_Value_Book','date':'Period_End_Date','IRR':'Investment_IRR'})
+
+            Pricing_df1.loc[:,"Currency"]='USD'
+            Pricing_df1 = Pricing_df1.drop(columns = ['Affiliate_Codename_combined'])
+
+            Pricing_df1['Investment_IRR'].loc[Pricing_df1['Investment_IRR'] > 100] = -1
+            Pricing_df1['Investment_IRR'] = Pricing_df1['Investment_IRR'].fillna(-1)
+            Pricing_df1 = Pricing_df1.loc[:, ['Affiliate','Affiliate_Code_Name','Issuer','WOGA_Code_Name','Asset_Type','Start_Date','Realization_Date','Realization_Status','Ending_Market_Value_Book','Period_End_Date','Investment_IRR',
+                                             'Currency', 'Affiliate_Borrower_ID']]
+
+            # Pricing_df1.to_csv(r'xxx', index=False)
+
+        except:
+            "Loader file data incomplete"
+
+
+        # Calculating affiliate IRRs:
+
+        Pricing_df2_Base = Affiliate_Borrower_Master_Final[Affiliate_Borrower_Master_Final.eval("WOGA_Reporting == 'Yes' & (Asset_Type != 'FACTORING')")]
+
+        Pricing_df2_Base['Affiliate'] = Pricing_df2_Base['Affiliate'].astype(str)
+        Pricing_df2_Base['Affiliate'] = Pricing_df2_Base['Affiliate'].apply(str.upper)
+        Pricing_df2_Base['Affiliate_Code_Name'] = Pricing_df2_Base['Affiliate_Code_Name'].astype(str)
+        Pricing_df2_Base['Affiliate_Code_Name'] = Pricing_df2_Base['Affiliate_Code_Name'].apply(str.upper)
+        Pricing_df2_Base_for_calc = Pricing_df2_Base.drop(columns = {'Asset_Type','WOGA_Reporting','Start_Date','Issuer','Sector','WOGA_Code_Name','Realization_Date','Realization_Status','Sub_Product_Type'})
+        # Pricing_df2_Base_for_calc.to_csv(r'xxx', index=False)
+
+        Pricing_df2_Base_for_calc = Pricing_df2_Base_for_calc.merge(Pricing_for_IRR, how = 'left', on = 'Affiliate_Code_Name')
+        # Pricing_df2_Base_for_calc.to_csv(r'xxx',
+        #                                  index=False)
+        Pricing_df2_Base_for_calc['flows'] = Pricing_df2_Base_for_calc['flows'].fillna(0)
+        Pricing_df2_Base_for_calc['date'] = Pricing_df2_Base_for_calc['date'].fillna(Current_Enddate)
+        Pricing_df2_Base_for_calc = Pricing_df2_Base_for_calc.drop(columns = ['Affiliate_y'])
+        Pricing_df2_Base_for_calc = Pricing_df2_Base_for_calc.rename(columns = {'Affiliate_x':'Affiliate'})
+
+
+
+
+        # Pricing_df2_Base_for_calc['date'] = pd.to_datetime(Pricing_df2_Base_for_calc['date']).dt.date
+
+
+        Combined_Flows['Affiliate_Code_Name'] = Combined_Flows['Affiliate_Code_Name'].astype(str)
+        Combined_Flows['Affiliate_Code_Name'] = Combined_Flows['Affiliate_Code_Name'].apply(str.upper)
+
+        Pricing_df2_Base_Flows = Pricing_df2_Base_for_calc.drop(columns = ['flows','date'])
+
+        Pricing_df2_Base_Flows = Pricing_df2_Base_Flows.merge(Combined_Flows, how='left', on='Affiliate_Code_Name')
+
+        Pricing_df2_Base_Flows = Pricing_df2_Base_Flows.rename(columns={'Affiliate_x': 'Affiliate'})
+
+        Pricing_df2_Base_Flows = Pricing_df2_Base_Flows.drop(columns = ['Affiliate_y'])
+
+
+        Pricing_Flows_Combined_df2 = pd.concat([Pricing_df2_Base_Flows, Pricing_df2_Base_for_calc])
+        # Pricing_Flows_Combined_df2['date'] = pd.to_datetime(Pricing_Flows_Combined_df2['date']).dt.date
+        # Pricing_Flows_Combined_df2 = Pricing_Flows_Combined_df2.drop(columns = ['Loan_Details_ID','Position_ID','Cashflow_ID_x','Cashflow_ID_y','Cashflow_ID'])
+
+        Pricing_Flows_Combined_df2['Affiliate'] = Pricing_Flows_Combined_df2['Affiliate'].astype(str)
+        Pricing_Flows_Combined_df2['Affiliate'] = Pricing_Flows_Combined_df2['Affiliate'].apply(str.upper)
+
+        # Pricing_Flows_Combined_df2.to_csv(r'xxx', index=False)
+        Pricing_Flows_Combined_df2 = Pricing_Flows_Combined_df2.dropna()
+        IRR_Calc_df2 = Pricing_Flows_Combined_df2.groupby('Affiliate')[["date", "flows"]].apply(xirr, silent=True)
+
+
+        IRR_values_df2 = IRR_Calc_df2.to_frame()
+        IRR_values_df2 = IRR_values_df2.rename(columns={0: 'IRR'})
+        IRR_values_df2 = IRR_values_df2.reset_index()
+
+        Pricing_df2 = IRR_values_df2
+        Pricing_df2.loc[:,'Issuer'] = 'Total Portfolio'
+        Pricing_df2.loc[:,'Affiliate_Code_Name'] = 'Total Portfolio'
+        Pricing_df2.loc[:,'Period_End_Date'] = Current_Enddate
+        Pricing_df2.loc[:,'Currency'] = 'USD'
+        Pricing_df2.loc[:,'WOGA_Code_Name'] = ''
+
+        Pricing_df2.loc[:, 'Realization_Status'] = ''
+        Pricing_df2.loc[:, 'Realization_Date'] = '12/30/1899'
+        Pricing_df2.loc[:, "Asset_Type"] = 'NA'
+        Pricing_df2.loc[:, "Affiliate_Borrower_ID"] = 'NA'
+
+        Pricing_df2_FMVS = Pricing_df2_Base_for_calc.groupby('Affiliate').sum('flows')
+        Pricing_df2_FMVS = Pricing_df2_FMVS.reset_index()
+
+        Pricing_df2 = Pricing_df2_FMVS.merge(Pricing_df2, how = 'left')
+        Pricing_df2['Issuer'] = Pricing_df2['Issuer'].fillna('Total Portfolio')
+        Pricing_df2['Affiliate_Code_Name'] = Pricing_df2['Affiliate_Code_Name'].fillna('Total Portfolio')
+        Pricing_df2['WOGA_Code_Name'] = Pricing_df2['WOGA_Code_Name'].fillna('Total Portfolio')
+        Pricing_df2['Asset_Type'] = Pricing_df2['Asset_Type'].fillna('NA')
+        Pricing_df2['Realization_Date'] = Pricing_df2['Realization_Date'].fillna('12/30/1899')
+        Pricing_df2['Period_End_Date'] = Pricing_df2['Period_End_Date'].fillna(Current_Enddate)
+
+        Pricing_df2['Currency'] = Pricing_df2['Currency'].fillna('USD')
+        Pricing_df2['Affiliate_Borrower_ID'] = Pricing_df2['Affiliate_Borrower_ID'].fillna('NA')
+        # Pricing_df2.to_csv(r'xxx',
+        #                         index=False)
+
+        # Pulling affiliate start dates from Affiliate Master (for pricing_df2_final):
+
+        Affiliate_Master = pd.read_sql_query(f"""SELECT [StartDate]
+          ,[Affiliate_ID]
+    
+        FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_Master];""", database_con)
+
+        Affiliate_Master = Affiliate_Master.rename(columns = {'Affiliate_ID':'Affiliate','StartDate':'Start_Date'})
+        Affiliate_Master['Affiliate'] = Affiliate_Master['Affiliate'].replace('WOA','WOAM')
+
+        Affiliate_Master['Affiliate'] = Affiliate_Master['Affiliate'].astype(str)
+        Affiliate_Master['Affiliate'] = Affiliate_Master['Affiliate'].apply(str.upper)
+
+        Pricing_df2['Affiliate'] = Pricing_df2['Affiliate'].astype(str)
+        Pricing_df2['Affiliate'] = Pricing_df2['Affiliate'].apply(str.upper)
+
+        Pricing_df2 = Pricing_df2.merge(Affiliate_Master, how ='left', on = 'Affiliate')
+
+
+        Pricing_df2 = Pricing_df2.rename(columns={'flows':'Ending_Market_Value_Book','IRR':'Investment_IRR'})
+
+        Pricing_df2['Affiliate'] = Pricing_df2['Affiliate'].replace('WOA', 'WOAM')
+        Pricing_df2 = Pricing_df2.loc[:, ['Affiliate', 'Affiliate_Code_Name', 'Issuer', 'WOGA_Code_Name', 'Asset_Type', 'Start_Date', 'Realization_Date',
+                'Realization_Status', 'Ending_Market_Value_Book', 'Period_End_Date', 'Investment_IRR',
+                'Currency', 'Affiliate_Borrower_ID']]
+
+        # Pricing_df2.to_csv(r'xxx', index=False)
+
+    #    pulling/creating/calculating other columns for Total Affiliate IRR (all affiliates combined):
+
+        Pricing_Flows_Combined_df2.loc[:,['IRR_Level']] = 'Total Affiliate'
+        Pricing_Flows_Combined_df3 = Pricing_Flows_Combined_df2
+        Pricing_df2_Base_for_calc.loc[:,['IRR_Level']] = 'Total Affiliate'
+        Pricingdf3_FMV = Pricing_df2_Base_for_calc['flows'].sum()
+
+        # Pricing_Flows_Combined_df3.to_csv(r'xxx', index=False)
+        Total_IRR_Calc = Pricing_Flows_Combined_df3.groupby('IRR_Level')[["date", "flows"]].apply(xirr, silent=True)
+
+        Total_IRR = Total_IRR_Calc.to_frame()
+        Total_IRR = Total_IRR.rename(columns={0: 'Investment_IRR'})
+        Total_IRR = Total_IRR.reset_index()
+        Total_IRR = Total_IRR.rename(columns={'IRR_Level': 'Affiliate'})
+        Total_IRR.loc[:,"Issuer"] = 'Total Portfolio'
+        Total_IRR.loc[:, "Currency"] = 'USD'
+        Total_IRR.loc[:, "Period_End_Date"] = Current_Enddate
+        Total_IRR.loc[:, "WOGA_Code_Name"] = ''
+        Total_IRR.loc[:, "Realization_Date"] = '12/30/1899'
+        Total_IRR.loc[:, "Realization_Status"] = ''
+
+        Total_IRR.loc[:, "Affiliate_Code_Name"] = 'Total Portfolio'
+        Total_IRR.loc[:, "Ending_Market_Value_Book"] = Pricingdf3_FMV
+        Total_IRR.loc[:, "Asset_Type"] = 'NA'
+        Pricing_df2['Start_Date'] = pd.to_datetime(Pricing_df2['Start_Date']).dt.date
+        Total_IRR.loc[:, "Affiliate_Borrower_ID"] = 'NA'
+
+        Total_IRR.loc[:,"Start_Date"] = Pricing_df2['Start_Date'].min()
+
+        Pricing_df3 = Total_IRR.loc[:, ['Affiliate', 'Affiliate_Code_Name', 'Issuer', 'WOGA_Code_Name', 'Asset_Type', 'Start_Date', 'Realization_Date',
+                'Realization_Status', 'Ending_Market_Value_Book', 'Period_End_Date', 'Investment_IRR',
+                'Currency', 'Affiliate_Borrower_ID']]
+        Pricing_df3['WOGA_Code_Name'] = Pricing_df3['WOGA_Code_Name'].replace('','Total Portfolio')
+
+        # Pricing_df2['PeriodEndDate'] = pd.to_datetime(Pricing_df2['PeriodEndDate']).dt.date
+        Pricing_df2['Affiliate'] = Pricing_df2['Affiliate'].apply(str.upper)
+        Pricing_df2['Investment_IRR'].loc[Pricing_df2['Investment_IRR'] > 100] = -1
+        Pricing_df2['Investment_IRR'] = Pricing_df2['Investment_IRR'].fillna(-1)
+        Pricing_df2['WOGA_Code_Name'] = Pricing_df2['WOGA_Code_Name'].replace('','Total Portfolio')
+        # Pricing_df2.to_csv(r'V:\Kevin B - Dev\Affiliate_Flows_Test\Pricing_df2.csv', index=False)
+
+        # creating factoring pricing df:
+
+        Factoring_Pricing_Base = Affiliate_Borrower_Master_Final[Affiliate_Borrower_Master_Final.eval("WOGA_Reporting == 'Yes' & (Asset_Type == 'FACTORING')")]
+
+        Factoring_FMVs_df = Pricing_for_IRR
+        Factoring_FMVs_df['Affiliate'] = Factoring_FMVs_df['Affiliate'].apply(str.upper)
+        Factoring_FMVs_df['Affiliate_Code_Name'] = Factoring_FMVs_df['Affiliate_Code_Name'].apply(str.upper)
+
+        Factoring_Pricing_Base['Affiliate_Code_Name'] = Factoring_Pricing_Base['Affiliate_Code_Name'].apply(str.upper)
+        Factoring_Pricing_Base['Affiliate'] = Factoring_Pricing_Base['Affiliate'].apply(str.upper)
+
+        Factoring_Pricing_df = Factoring_Pricing_Base.merge(Factoring_FMVs_df, how = 'left', on = 'Affiliate_Code_Name')
+        # print(Factoring_Pricing_df)
+        Factoring_Pricing_df = Factoring_Pricing_df.drop(columns = ['Asset_Type','Sector','WOGA_Reporting','Sub_Product_Type','Affiliate_y'])
+        Factoring_Pricing_df['flows'] = Factoring_Pricing_df['flows'].fillna(0)
+        Factoring_Pricing_df['date'] = Factoring_Pricing_df['date'].fillna(Current_Enddate)
+        # Factoring_Pricing_df['date'] = pd.to_datetime(Factoring_Pricing_df['date']).dt.date
+        Factoring_Pricing_df = Factoring_Pricing_df.rename(columns = {'flows':'Ending_Market_Value_Book','date':'Period_End_Date','Affiliate_x':'Affiliate'})
+        Factoring_Pricing_df.loc[:,"Investment_IRR"] = -1
+        Factoring_Pricing_df.loc[:, "Currency"] = 'USD'
+        Factoring_Pricing_df.loc[:, "Asset_Type"] = 'FACTORING'
+        Factoring_Pricing_df = Factoring_Pricing_df.loc[:, ['Affiliate', 'Affiliate_Code_Name', 'Issuer', 'WOGA_Code_Name', 'Asset_Type', 'Start_Date', 'Realization_Date',
+                'Realization_Status', 'Ending_Market_Value_Book', 'Period_End_Date', 'Investment_IRR',
+                'Currency', 'Affiliate_Borrower_ID']]
+
+        # Factoring_Pricing_df.to_csv(r'xxx', index=False)
+
+        Pricing_df_Final = pd.concat([Pricing_df1, Factoring_Pricing_df, Pricing_df2, Pricing_df3])
+        # Pricing_df_Final.to_csv(r'xxx', index=False)
+        # logic to manually assign Period End Date:
+
+        Pricing_df_Final = Pricing_df_Final.drop(columns=['Period_End_Date'])
+        Pricing_df_Final.loc[:,'Period_End_Date'] = Current_Enddate
+
+
+
+        Pricing_df_Final = Pricing_df_Final.loc[:, ['Affiliate', 'Affiliate_Code_Name', 'Issuer', 'WOGA_Code_Name', 'Asset_Type', 'Start_Date', 'Realization_Date',
+                'Realization_Status', 'Ending_Market_Value_Book', 'Period_End_Date', 'Investment_IRR',
+                'Currency', 'Affiliate_Borrower_ID']]
+        Pricing_df_Final.loc[:,['Extract_Date']] = today
+        Pricing_df_Final['Realization_Date'] = pd.to_datetime(Pricing_df_Final['Realization_Date']).dt.date
+
+        Pricing_df_Final_loc = r'xxx'
+
+        Pricing_df_Final_Filename = f'Affiliate.wo_irr.{Current_Enddate_2}.{date2}.csv'
+
+        Pricing_df_Final.to_csv(f'xxx', index=False)
+
+
+        Pricing_df_Final.to_sql("Affiliate_IRR_Report", con=database_con, schema='xxx', if_exists='replace',
+                                      index=False,dtype = {'Start_Date': sqlalchemy.Date(),
+                                                           'Realization_Date': sqlalchemy.Date(),
+                                                           'Period_End_Date': sqlalchemy.Date(),
+                                                           'Extract_Date': sqlalchemy.Date()})
+
+        Pricing_df_Final = Pricing_df_Final.loc[:,
+                                 ['Affiliate', 'Issuer', 'Start_Date', 'Ending_Market_Value_Book', 'Investment_IRR',
+                                  'Currency', 'Affiliate_Code_Name', 'WOGA_Code_Name', 'Extract_Date',
+                                  'Period_End_Date', 'Realization_Status', 'Realization_Date', 'Affiliate_Borrower_ID',
+                                  'Asset_Type']]
+        Pricing_df_Final.to_sql("Affiliate_IRR_Report", con=database_con, schema='xxx', if_exists='append',
+                                      index=False, dtype = {'Start_Date': sqlalchemy.Date(),
+                                                           'Realization_Date': sqlalchemy.Date(),
+                                                           'Period_End_Date': sqlalchemy.Date(),
+                                                           'Extract_Date': sqlalchemy.Date(),
+                                                           'Ending_Market_Value_Book': sqlalchemy.types.Float(),
+                                                           'Investment_IRR': sqlalchemy.types.Float()})
+
+
+
+except:
+    # raise Exception
+    print("There was an error in the code line 735")
+    p = subprocess.Popen(['xxx',
+                          'xxx'],
+                         stdout=sys.stdout)
+    p.communicate()
+
+
+
+
+try:
+    path = Path(r'xxx')
+    if os.listdir(path) == []:
+        print("no loader file")
+        # Current_Enddate = datetime.today() - pd.tseries.offsets.QuarterEnd()
+        Current_Enddate = Current_Enddate.strftime('%m%d%Y')
+
+        today = date.today()
+        today = today.strftime('%m/%d/%Y')
+
+        Affiliate_Borrower_Master_noloader = pd.read_sql_query(f"""SELECT [Affiliate_Code_Name]
+        ,[Asset_Type]
+        ,[Start_Date]
+        ,[WOGA_Reporting]
+        ,[Issuer]
+        ,[Affiliate]
+        ,[Sector]
+        ,[WOGA_Code_Name]
+        ,[Realization_Date]
+        ,[Realization_Status]
+        ,[Sub_Product_Type]
+        ,[Loan_Details_ID]
+        ,[Position_ID]
+        ,[Cashflow_ID]
+        ,[Affiliate_Borrower_ID]
+        ,[Country]
+        ,[Restructure_ID]
+        FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_Borrower_Master]
+    
+                     ;""", database_con)
+
+        date = datetime.today()
+        date = date.strftime("%m_%d_%Y")
+
+        Affiliate_Borrower_Master_loc = r'xxx'
+        Affiliate_Borrower_Master_Filename = f'Affiliate_Borrower_Master_Table_{date}.csv'
+
+        Affiliate_Borrower_Master_noloader['Affiliate'] = Affiliate_Borrower_Master_noloader['Affiliate'].replace('WOA','WOAM')
+        Affiliate_Borrower_Master_noloader.loc[:,'Extract_Date'] = today
+
+        # Affiliate_Borrower_Master_noloader = Affiliate_Borrower_Master_noloader.rename(columns = {'Initial_Investment_Date':'Start_Date','KeyDesc':'Issuer','Portfolio':'Affiliate','WOGA_CodeName':'WOGA_Code_Name',
+        #                                                                                           'Realized_Date':'Realization_Date','Realized':'Realization_Status'})
+        Affiliate_Borrower_Master_noloader['Sector'] = Affiliate_Borrower_Master_noloader['Sector'].astype(str)
+        Affiliate_Borrower_Master_noloader['Sector'] = Affiliate_Borrower_Master_noloader['Sector'].apply(str.upper)
+        Affiliate_Borrower_Master_noloader['Realization_Date'] = pd.to_datetime(Affiliate_Borrower_Master_noloader['Realization_Date']).dt.date
+        Affiliate_Borrower_Master_noloader['Start_Date'] = pd.to_datetime(Affiliate_Borrower_Master_noloader['Start_Date']).dt.date
+        placeholder_date = Affiliate_Borrower_Master_noloader['Realization_Date'].min()
+
+
+        Affiliate_Borrower_Master_noloader['Realization_Status'] = np.where(Affiliate_Borrower_Master_noloader['Realization_Date'] > placeholder_date, 'Realized', 'Unrealized')
+
+        Position_and_Loan_ID_Mapping = {
+            'Affiliate': ['WO ABL', 'WOAM', 'WOBC', 'WOCF', 'WOCFE', 'WOEF', 'WOHCF', 'WOLF', 'WOTF', 'WOREC',
+                          'WOCFE 2'],
+            'Position_ID_Mapping': ['Borrower Name', 'Borrower Name', 'Borrower Name', 'Loan ID', 'Borrower Name',
+                                    'Loan_Name', 'Loan ID', 'Borrower Name', 'Loan_Name', 'Borrower Name', 'Loan ID'],
+            'Loan_ID_Mapping': ['Borrower Name', 'Borrower Name', 'Borrower Name', 'Code_Name', 'Borrower Name',
+                                'Loan_Name', 'Loan ID', 'Borrower Name', 'Code_Name', 'Borrower Name', 'Borrower Name']}
+
+        Position_and_Loan_ID_Mapping = pd.DataFrame(Position_and_Loan_ID_Mapping)
+
+        Affiliate_Borrower_Master_noloader = Affiliate_Borrower_Master_noloader.merge(Position_and_Loan_ID_Mapping, how = 'left', on = 'Affiliate')
+
+
+        Affiliate_Borrower_Master_noloader.to_csv(f'{Affiliate_Borrower_Master_loc}/{Affiliate_Borrower_Master_Filename}',
+                                               index=False)
+
+        Affiliate_IRR_Cashflow_noloader= pd.read_sql_query(f"""SELECT [ADate]
+          ,[Affiliate]
+          ,[Issuer]
+          ,[flows]
+          ,[Period_End_Date]
+          ,[Affiliate_Code_Name]
+          ,[WOGA_Code_Name]
+          ,[Cashflow_ID]
+          ,[Extract_Date]
+            FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_IRR_Cashflow_Report]
+    
+                     ;""", database_con)
+        # Affiliate_Flows_loc = r'xxx'
+
+        # Affiliate_IRR_Cashflow_noloader = pd.read_csv(Affiliate_Flows_loc)
+
+
+        date2 = datetime.today()
+        date2 = date2.strftime( "%m%d%Y")
+        Affiliate_IRR_Cashflow_noloader['Cashflow_ID'] = Affiliate_IRR_Cashflow_noloader['Cashflow_ID'].str.replace(",","")
+        Affiliate_IRR_Cashflow_noloader['Cashflow_ID'] = Affiliate_IRR_Cashflow_noloader['Cashflow_ID'].str.replace('"',"")
+        Affiliate_Flows_loc = r'xxx'
+
+        Affiliate_Flows_Filename = f'Affiliate.wo_irr_cashflow.{Current_Enddate}.{date2}.csv'
+
+        Affiliate_IRR_Cashflow_noloader.loc[:,'Extract_Date'] = today
+
+        # Affiliate_IRR_Cashflow_noloader = Affiliate_IRR_Cashflow_noloader.rename(columns = {'Port':'Affiliate','PeriodEndDate':'Period_End_Date'})
+        Affiliate_IRR_Cashflow_noloader.to_csv(f'{Affiliate_Flows_loc}/{Affiliate_Flows_Filename}', index=False)
+
+        Affiliate_IRR_noloader = pd.read_sql_query(f"""SELECT [Affiliate]
+              ,[Affiliate_Code_Name]
+              ,[Issuer]
+              ,[WOGA_Code_Name]
+              ,[Asset_Type]
+              ,[Start_Date]
+              ,[Realization_Date]
+              ,[Realization_Status]
+              ,[Ending_Market_Value_Book]
+              ,[Period_End_Date]
+              ,[Investment_IRR]
+              ,[Currency]
+              ,[Affiliate_Borrower_ID]
+             
+              
+          FROM [EnterpriseDatawarehouse].['xxx'].[Affiliate_IRR_Report]
+                          ;""", database_con)
+
+        Affiliate_IRR_noloader['Investment_IRR'] = Affiliate_IRR_noloader['Investment_IRR'].replace('NA', -1)
+
+
+        Pricing_df_Final_loc = r'xxx'
+
+        Pricing_df_Final_Filename = f'Affiliate.wo_irr.{Current_Enddate}.{date2}.csv'
+        # print(Affiliate_Borrower_Master_noloader)
+        # print(Affiliate_IRR_Cashflow_noloader)
+        # print(Affiliate_IRR_noloader)
+        Affiliate_IRR_noloader['WOGA_Code_Name'] = Affiliate_IRR_noloader['WOGA_Code_Name'].replace('WOAM','WOA')
+        # Affiliate_IRR_noloader['Investment_IRR'].loc[Affiliate_IRR_noloader['Investment_IRR'] > 100] = -1
+        Affiliate_IRR_noloader.loc[:,'Extract_Date'] = today
+        # Affiliate_IRR_noloader = Affiliate_IRR_noloader.rename(columns = {'Portfolio':'Affiliate','KeyDescr':'Issuer','RealizationDate':'Realization_Date','Realized':'Realization_Status','PeriodEndDate':'Period_End_Date'})
+        Affiliate_IRR_noloader.to_csv(f'{Pricing_df_Final_loc}/{Pricing_df_Final_Filename}', index=False)
+
+    #Direct load to edw:
+
+        pd.options.display.max_columns = None
+        server = 'xxx'
+        database = 'xxx'
+        # database = 'xxx'
+        driver = 'xxx'
+        database_con = f'mssql://@{server}/{database}?driver={driver}'
+
+
+        Affiliate_IRR_noloader.to_sql("Affiliate_IRR_Report",con=database_con, schema='xxx',if_exists='replace', index=False, dtype = {'Start_Date': sqlalchemy.Date(),
+                                                                                                                                       'Realization_Date': sqlalchemy.Date(),
+                                                                                                                                       'Period_End_Date': sqlalchemy.Date(),
+                                                                                                                                       'Extract_Date': sqlalchemy.Date()})
+        Affiliate_IRR_Cashflow_noloader.to_sql("Affiliate_IRR_Cashflow_Report",con=database_con, schema='xxx',if_exists='replace', index=False, dtype = {'ADate': sqlalchemy.Date(),
+                                                                                                                                                         'Period_End_Date': sqlalchemy.Date(),
+                                                                                                                                                         'Extract_Date': sqlalchemy.Date()})
+        Affiliate_Borrower_Master_noloader.to_sql("Affiliate_Borrower_Master", con=database_con, schema='xxx',
+                                                  if_exists='replace', index=False,
+                                                  dtype={'Initial_Investment_Date': sqlalchemy.Date(),
+                                                         'Realized_Date': sqlalchemy.Date(),
+                                                         'Extract_Date': sqlalchemy.Date()})
+
+
+        Affiliate_IRR_noloader = Affiliate_IRR_noloader.loc[:,['Affiliate','Issuer','Start_Date','Ending_Market_Value_Book','Investment_IRR','Currency','Affiliate_Code_Name','WOGA_Code_Name','Extract_Date',
+                                                                      'Period_End_Date','Realization_Status','Realization_Date','Affiliate_Borrower_ID','Asset_Type']]
+
+        Affiliate_IRR_noloader.to_sql("Affiliate_IRR_Report", con=database_con, schema='xxx', if_exists='append', index=False, dtype = {'Start_Date': sqlalchemy.Date(),
+                                                                   'Realization_Date': sqlalchemy.Date(),
+                                                                   'Period_End_Date': sqlalchemy.Date(),
+                                                                   'Extract_Date': sqlalchemy.Date(),
+                                                                   'Ending_Market_Value_Book': sqlalchemy.types.Float(),
+                                                                   'Investment_IRR': sqlalchemy.types.Float()})
+
+        Affiliate_IRR_Cashflow_noloader.to_sql("Affiliate_IRR_Cashflow_Report", con=database_con, schema='xxx',if_exists='append', index=False, dtype={'ADate': sqlalchemy.Date(),
+                                                                             'Period_End_Date': sqlalchemy.Date(),
+                                                                             'Extract_Date': sqlalchemy.Date()})
+
+    else:
+        print("loader file available")
+
+except:
+    # raise Exception
+    print("There was an error in the code")
+    p = subprocess.Popen(["powershell.exe",
+                          'xxx'],
+                         stdout=sys.stdout)
+    p.communicate()
+
